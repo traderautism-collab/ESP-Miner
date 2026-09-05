@@ -54,31 +54,13 @@ void create_jobs_task(void *pvParameters)
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     uint64_t extranonce_2 = 0;
 
-    // --- VERBETERING 1: Dynamische timeout op basis van hashrate ---
-    // Bereken initiële timeout als fallback (500 ms)
-    int timeout_ms = 500;
+    // --- Vaste timeout (kan later dynamisch worden gemaakt als hashrate beschikbaar is) ---
+    int timeout_ms = 500;  // 500 ms is een goede standaard
 
-    ESP_LOGI(TAG, "ASIC Job Interval: dynamic (based on hashrate)");
+    ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready!");
 
     while (1) {
-        // --- VERBETERING 2: Update timeout dynamisch op basis van hashrate ---
-        // Hashrate wordt bijgewerkt door statistics_task
-        double hashrate = GLOBAL_STATE->hashrate; // in H/s
-        if (hashrate > 0) {
-            // Tijd om alle 2^32 nonces te doorlopen (in seconden)
-            double seconds_for_all_nonces = (double)0xFFFFFFFF / hashrate;
-            // Stel timeout in op 80% van die tijd, zodat we net voor de uitputting een nieuwe job sturen
-            int new_timeout = (int)(seconds_for_all_nonces * 0.8 * 1000);
-            // Begrenzing: minimaal 100 ms, maximaal 10 seconden
-            if (new_timeout < 100) new_timeout = 100;
-            if (new_timeout > 10000) new_timeout = 10000;
-            timeout_ms = new_timeout;
-        } else {
-            // Fallback als hashrate nog niet bekend is
-            timeout_ms = 500;
-        }
-
         if (GLOBAL_STATE->reset_extranonce2) {
             ESP_LOGI(TAG, "Resetting extranonce2 to 0 due to set_extranonce request");
             extranonce_2 = 0;
@@ -113,6 +95,7 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGW(TAG, "Protocol switch detected during dequeue, discarding stale item");
                 free(new_work);
                 current_work_protocol = active_protocol;
+                timeout_ms = 500;  // reset timeout
                 continue;
             }
 
@@ -167,6 +150,7 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
             if (active_protocol == STRATUM_PROTOCOL_V2 && !stratum_v2_is_extended_channel(GLOBAL_STATE)) {
+                timeout_ms = 500;
                 continue;
             }
         }
@@ -176,6 +160,7 @@ void create_jobs_task(void *pvParameters)
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
             current_work_protocol = active_protocol;
+            timeout_ms = 500;
             continue;
         }
 
@@ -189,11 +174,11 @@ void create_jobs_task(void *pvParameters)
             }
         } else {
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            // --- VERBETERING 3: Grotere stap voor extranonce_2 ---
+            // Verbetering: grotere stap voor extranonce_2
             extranonce_2 += 1000;
             if (extranonce_2 > UINT64_MAX - 1000) extranonce_2 = 0;
         }
-        // Timeout wordt volgende iteratie opnieuw berekend
+        timeout_ms = 500;  // reset timeout (blijft vast)
     }
 }
 
@@ -230,8 +215,7 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
         ESP_LOGW(TAG, "Timestamp offset capped, resetting to 0");
     }
 
-    // --- VERBETERING 4: Deterministische startnonce (geen esp_random meer) ---
-    // Gebruik een golden-ratio multiplier om de nonce te spreiden op basis van extranonce_2
+    // Verbetering: deterministische startnonce (geen esp_random)
     next_job->starting_nonce = (uint32_t)((extranonce_2 * 0x9e3779b9ULL) & 0xFFFFFFFF);
 
     // Metadata
