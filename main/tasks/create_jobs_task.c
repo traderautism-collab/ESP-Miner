@@ -1,5 +1,6 @@
 #include <sys/time.h>
 #include <limits.h>
+#include <stdint.h>
 
 #include "work_queue.h"
 #include "global_state.h"
@@ -8,7 +9,6 @@
 #include "mining.h"
 #include "string.h"
 #include "esp_timer.h"
-#include "esp_random.h"   // <-- TOEGEVOEGD (fix voor esp_random())
 
 #include "asic.h"
 #include "system.h"
@@ -54,18 +54,35 @@ void create_jobs_task(void *pvParameters)
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     uint64_t extranonce_2 = 0;
 
-    // MODIFICATIE: vaste jobfrequentie (500 ms) – kun je aanpassen
-    int timeout_ms = 500;  // was: ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+    // --- VERBETERING 1: Dynamische timeout op basis van hashrate ---
+    // Bereken initiële timeout als fallback (500 ms)
+    int timeout_ms = 500;
 
-    ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
+    ESP_LOGI(TAG, "ASIC Job Interval: dynamic (based on hashrate)");
     ESP_LOGI(TAG, "ASIC Ready!");
 
     while (1) {
+        // --- VERBETERING 2: Update timeout dynamisch op basis van hashrate ---
+        // Hashrate wordt bijgewerkt door statistics_task
+        double hashrate = GLOBAL_STATE->hashrate; // in H/s
+        if (hashrate > 0) {
+            // Tijd om alle 2^32 nonces te doorlopen (in seconden)
+            double seconds_for_all_nonces = (double)0xFFFFFFFF / hashrate;
+            // Stel timeout in op 80% van die tijd, zodat we net voor de uitputting een nieuwe job sturen
+            int new_timeout = (int)(seconds_for_all_nonces * 0.8 * 1000);
+            // Begrenzing: minimaal 100 ms, maximaal 10 seconden
+            if (new_timeout < 100) new_timeout = 100;
+            if (new_timeout > 10000) new_timeout = 10000;
+            timeout_ms = new_timeout;
+        } else {
+            // Fallback als hashrate nog niet bekend is
+            timeout_ms = 500;
+        }
+
         if (GLOBAL_STATE->reset_extranonce2) {
             ESP_LOGI(TAG, "Resetting extranonce2 to 0 due to set_extranonce request");
             extranonce_2 = 0;
             GLOBAL_STATE->reset_extranonce2 = false;
-            // MODIFICATIE: reset ook de timestamp-offset bij een nieuwe extranonce
             ntime_offset = 0;
         }
 
@@ -96,7 +113,6 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGW(TAG, "Protocol switch detected during dequeue, discarding stale item");
                 free(new_work);
                 current_work_protocol = active_protocol;
-                timeout_ms = 500;  // MODIFICATIE
                 continue;
             }
 
@@ -137,7 +153,6 @@ void create_jobs_task(void *pvParameters)
                 clean = ((mining_notify *)current_work)->clean_jobs;
             }
 
-            // MODIFICATIE: bij clean_jobs ook de timestamp-offset resetten
             if (clean) {
                 ntime_offset = 0;
                 ESP_LOGI(TAG, "Clean job: timestamp offset reset to 0");
@@ -152,7 +167,6 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
             if (active_protocol == STRATUM_PROTOCOL_V2 && !stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                timeout_ms = 500;  // MODIFICATIE
                 continue;
             }
         }
@@ -162,7 +176,6 @@ void create_jobs_task(void *pvParameters)
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
             current_work_protocol = active_protocol;
-            timeout_ms = 500;  // MODIFICATIE
             continue;
         }
 
@@ -176,15 +189,15 @@ void create_jobs_task(void *pvParameters)
             }
         } else {
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            // MODIFICATIE: extranonce_2 sneller laten variëren? We verhogen met 1, maar kunnen ook met een grotere stap.
-            // Bijv. extranonce_2 += 100;  // Zolang de teller maar niet overloopt.
-            extranonce_2++;
+            // --- VERBETERING 3: Grotere stap voor extranonce_2 ---
+            extranonce_2 += 1000;
+            if (extranonce_2 > UINT64_MAX - 1000) extranonce_2 = 0;
         }
-        timeout_ms = 500;  // MODIFICATIE
+        // Timeout wordt volgende iteratie opnieuw berekend
     }
 }
 
-// ==================== generate_work (V1) met alle aanpassingen ====================
+// ==================== generate_work (V1) ====================
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty)
 {
     if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
@@ -208,10 +221,7 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
 
     construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask, difficulty, next_job);
 
-    // MODIFICATIE 1: Timestamp rollen
-    // De pool accepteert meestal maximaal ±2 uur afwijking. We gebruiken een offset die per job oploopt.
-    // We capen op 3600 (1 uur) en resetten dan naar 0 om te voorkomen dat we buiten het venster vallen.
-    // Als de pool strenger is, kun je de cap verlagen.
+    // Timestamp-rolling (offset per job, cap op 1 uur)
     #define MAX_NTIME_OFFSET 3600  // 1 uur in seconden
     next_job->ntime = notification->ntime + ntime_offset;
     ntime_offset++;
@@ -220,9 +230,9 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
         ESP_LOGW(TAG, "Timestamp offset capped, resetting to 0");
     }
 
-    // MODIFICATIE 2: Willekeurige startnonce (in plaats van 0)
-    // Dit zorgt ervoor dat de ASIC niet altijd op dezelfde plek begint.
-    next_job->starting_nonce = esp_random();  // 32-bit random
+    // --- VERBETERING 4: Deterministische startnonce (geen esp_random meer) ---
+    // Gebruik een golden-ratio multiplier om de nonce te spreiden op basis van extranonce_2
+    next_job->starting_nonce = (uint32_t)((extranonce_2 * 0x9e3779b9ULL) & 0xFFFFFFFF);
 
     // Metadata
     next_job->extranonce2 = strdup(extranonce_2_str);
