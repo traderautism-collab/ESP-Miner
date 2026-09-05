@@ -22,6 +22,9 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
+// Globale teller voor timestamp-rolling (alleen V1)
+static uint32_t ntime_offset = 0;
+
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2_counter);
@@ -45,14 +48,13 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     double difficulty = GLOBAL_STATE->pool_difficulty;
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     uint64_t extranonce_2 = 0;
-    int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+
+    // MODIFICATIE: vaste jobfrequentie (500 ms) – kun je aanpassen
+    int timeout_ms = 500;  // was: ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready!");
@@ -62,14 +64,12 @@ void create_jobs_task(void *pvParameters)
             ESP_LOGI(TAG, "Resetting extranonce2 to 0 due to set_extranonce request");
             extranonce_2 = 0;
             GLOBAL_STATE->reset_extranonce2 = false;
+            // MODIFICATIE: reset ook de timestamp-offset bij een nieuwe extranonce
+            ntime_offset = 0;
         }
 
-        // Read protocol dynamically each iteration (coordinator may have switched it)
         stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
 
-        // If protocol changed, discard current_work (it belongs to the old protocol)
-        // Always update current_work_protocol so the post-dequeue check doesn't
-        // incorrectly discard the first valid work item from the new protocol.
         if (active_protocol != current_work_protocol) {
             if (current_work != NULL) {
                 ESP_LOGI(TAG, "Protocol switched from %s to %s, discarding current work",
@@ -88,24 +88,17 @@ void create_jobs_task(void *pvParameters)
         if (new_work != NULL) {
             active_protocol = GLOBAL_STATE->stratum_protocol;
 
-            // Free previous work using the protocol it was created under
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
 
             if (active_protocol != current_work_protocol) {
-                // Protocol switched during our blocking dequeue.
-                // The dequeued item may be from either the old or new protocol —
-                // we cannot safely determine which type it is, so discard it.
-                // free() is safe for both sv2_job_t (flat) and mining_notify (malloc'd;
-                // internal strings leak but this is a rare protocol-switch event).
                 ESP_LOGW(TAG, "Protocol switch detected during dequeue, discarding stale item");
                 free(new_work);
                 current_work_protocol = active_protocol;
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+                timeout_ms = 500;  // MODIFICATIE
                 continue;
             }
 
-            // Protocol unchanged — item matches current_work_protocol. Safe to cast.
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
                     ESP_LOGI(TAG, "New Work Dequeued SV2 ext job %lu", ((sv2_ext_job_t *)new_work)->job_id);
@@ -132,7 +125,6 @@ void create_jobs_task(void *pvParameters)
 
             extranonce_2 = 0;
 
-            // Check clean_jobs flag
             bool clean;
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
@@ -143,6 +135,13 @@ void create_jobs_task(void *pvParameters)
             } else {
                 clean = ((mining_notify *)current_work)->clean_jobs;
             }
+
+            // MODIFICATIE: bij clean_jobs ook de timestamp-offset resetten
+            if (clean) {
+                ntime_offset = 0;
+                ESP_LOGI(TAG, "Clean job: timestamp offset reset to 0");
+            }
+
             if (!clean) {
                 continue;
             }
@@ -151,25 +150,18 @@ void create_jobs_task(void *pvParameters)
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            // SV2 standard channel: the ASIC has enough nonce+version space
-            // (2^32 nonces x version rolls) to keep mining without re-feeding.
-            // Re-sending the same job restarts the nonce search from 0 and
-            // produces duplicate shares. Only send work on new jobs.
-            // (V1 and SV2 extended are fine — extranonce_2 gives unique work each time.)
             if (active_protocol == STRATUM_PROTOCOL_V2 && !stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+                timeout_ms = 500;  // MODIFICATIE
                 continue;
             }
         }
 
-        // Final protocol check before generating work — protocol may have switched
-        // during a timeout dequeue while we still hold stale current_work
         active_protocol = GLOBAL_STATE->stratum_protocol;
         if (active_protocol != current_work_protocol) {
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
             current_work_protocol = active_protocol;
-            timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+            timeout_ms = 500;  // MODIFICATIE
             continue;
         }
 
@@ -183,12 +175,15 @@ void create_jobs_task(void *pvParameters)
             }
         } else {
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
+            // MODIFICATIE: extranonce_2 sneller laten variëren? We verhogen met 1, maar kunnen ook met een grotere stap.
+            // Bijv. extranonce_2 += 100;  // Zolang de teller maar niet overloopt.
             extranonce_2++;
         }
-        timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
+        timeout_ms = 500;  // MODIFICATIE
     }
 }
 
+// ==================== generate_work (V1) met alle aanpassingen ====================
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty)
 {
     if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
@@ -205,7 +200,6 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     calculate_merkle_root_hash(coinbase_tx_hash, (uint8_t(*)[32])notification->merkle_branches, notification->n_merkle_branches, merkle_root);
 
     bm_job *next_job = malloc(sizeof(bm_job));
-
     if (next_job == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for new job");
         return;
@@ -213,14 +207,28 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
 
     construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask, difficulty, next_job);
 
+    // MODIFICATIE 1: Timestamp rollen
+    // De pool accepteert meestal maximaal ±2 uur afwijking. We gebruiken een offset die per job oploopt.
+    // We capen op 3600 (1 uur) en resetten dan naar 0 om te voorkomen dat we buiten het venster vallen.
+    // Als de pool strenger is, kun je de cap verlagen.
+    #define MAX_NTIME_OFFSET 3600  // 1 uur in seconden
+    next_job->ntime = notification->ntime + ntime_offset;
+    ntime_offset++;
+    if (ntime_offset > MAX_NTIME_OFFSET) {
+        ntime_offset = 0;
+        ESP_LOGW(TAG, "Timestamp offset capped, resetting to 0");
+    }
+
+    // MODIFICATIE 2: Willekeurige startnonce (in plaats van 0)
+    // Dit zorgt ervoor dat de ASIC niet altijd op dezelfde plek begint.
+    next_job->starting_nonce = esp_random();  // 32-bit random
+
+    // Metadata
     next_job->extranonce2 = strdup(extranonce_2_str);
     next_job->jobid = strdup(notification->job_id);
     next_job->version_mask = GLOBAL_STATE->version_mask;
 
-    // Check if ASIC is initialized before trying to send work
     if (!GLOBAL_STATE->ASIC_initalized) {
-        // Clean up the job since we're not sending it
-        // Note: This job was never stored in active_jobs, so it's safe to free
         ESP_LOGW(TAG, "ASIC not initialized, skipping job send");
         free(next_job->jobid);
         free(next_job->extranonce2);
@@ -231,9 +239,7 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-// Construct bm_job directly from SV2 fields (no coinbase/merkle computation needed).
-// Standard channels rely on version rolling for unique work — the ASIC rolls the
-// version bits using version_mask, giving different midstates per nonce search space.
+// ==================== generate_work_sv2 (standaard kanaal) ====================
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, double difficulty)
 {
     bm_job *next_job = malloc(sizeof(bm_job));
@@ -250,13 +256,9 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     next_job->starting_nonce = 0;
     next_job->pool_diff = difficulty;
 
-    // SV2 provides merkle_root and prev_hash in internal byte order (SHA-256 output order).
-    // For bm_job storage: apply reverse_32bit_words (same as construct_bm_job does)
     reverse_32bit_words(sv2_job->merkle_root, next_job->merkle_root);
     reverse_32bit_words(sv2_job->prev_hash, next_job->prev_block_hash);
 
-    // Compute midstate(s) using the same logic as construct_bm_job.
-    // Midstate covers bytes 0-63 of block header: version(4B) + prev_hash(32B) + merkle_root[0:28](28B).
     uint8_t midstate_data[64];
     uint32_t base_version = sv2_job->version;
     memcpy(midstate_data, &base_version, 4);
@@ -287,11 +289,10 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
         next_job->num_midstates = 1;
     }
 
-    // SV2 job metadata
     char jobid_str[16];
     snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, sv2_job->job_id);
     next_job->jobid = strdup(jobid_str);
-    next_job->extranonce2 = strdup(""); // unused in SV2 standard
+    next_job->extranonce2 = strdup("");
     next_job->version_mask = version_mask;
 
     if (!GLOBAL_STATE->ASIC_initalized) {
@@ -305,8 +306,7 @@ static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job, dou
     ASIC_send_work(GLOBAL_STATE, next_job);
 }
 
-// Extended channel work generation: compute coinbase hash from prefix+extranonce+suffix,
-// then merkle root from merkle path, then midstates. extranonce_2 provides unique work.
+// ==================== generate_work_sv2_ext (extended kanaal) ====================
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_job,
                                    double difficulty, uint64_t extranonce_2_counter)
 {
@@ -321,18 +321,14 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
 
     uint32_t version_mask = GLOBAL_STATE->version_mask;
 
-    // Derive extranonce_2 from counter
-    // SV2 spec: extranonce_size is the miner's rollable portion (not total)
     uint8_t extranonce_2_len = conn->extranonce_size;
     uint8_t extranonce_2[32];
     memset(extranonce_2, 0, sizeof(extranonce_2));
-    // Encode counter as big-endian bytes
     for (int i = extranonce_2_len - 1; i >= 0 && extranonce_2_counter > 0; i--) {
         extranonce_2[i] = (uint8_t)(extranonce_2_counter & 0xFF);
         extranonce_2_counter >>= 8;
     }
 
-    // Compute coinbase tx hash: prefix + extranonce_prefix + extranonce_2 + suffix
     uint8_t coinbase_tx_hash[32];
     calculate_coinbase_tx_hash_bin(
         ext_job->coinbase_prefix, ext_job->coinbase_prefix_len,
@@ -341,24 +337,20 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
         ext_job->coinbase_suffix, ext_job->coinbase_suffix_len,
         coinbase_tx_hash);
 
-    // Compute merkle root
     uint8_t merkle_root[32];
     calculate_merkle_root_hash(coinbase_tx_hash,
                                (const uint8_t (*)[32])ext_job->merkle_path,
                                ext_job->merkle_path_count, merkle_root);
 
-    // Fill bm_job fields
     next_job->version = ext_job->version;
     next_job->target = ext_job->nbits;
-    next_job->ntime = ext_job->ntime;  // no offset — extranonce provides uniqueness
+    next_job->ntime = ext_job->ntime;
     next_job->starting_nonce = 0;
     next_job->pool_diff = difficulty;
 
-    // Same byte-order handling as generate_work_sv2
     reverse_32bit_words(merkle_root, next_job->merkle_root);
     reverse_32bit_words(ext_job->prev_hash, next_job->prev_block_hash);
 
-    // Compute midstate(s)
     uint8_t midstate_data[64];
     uint32_t base_version = ext_job->version;
     memcpy(midstate_data, &base_version, 4);
@@ -389,12 +381,10 @@ static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
         next_job->num_midstates = 1;
     }
 
-    // Job metadata
     char jobid_str[16];
     snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, ext_job->job_id);
     next_job->jobid = strdup(jobid_str);
 
-    // Store extranonce_2 as hex for share submission
     char en2_hex[65];
     bin2hex(extranonce_2, extranonce_2_len, en2_hex, sizeof(en2_hex));
     next_job->extranonce2 = strdup(en2_hex);
