@@ -8,6 +8,7 @@
 #include "mining.h"
 #include "string.h"
 #include "esp_timer.h"
+#include "esp_random.h"   // <-- TOEGEVOEGD (fix voor esp_random())
 
 #include "asic.h"
 #include "system.h"
