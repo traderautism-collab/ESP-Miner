@@ -54,8 +54,8 @@ void create_jobs_task(void *pvParameters)
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     uint64_t extranonce_2 = 0;
 
-    // --- Vaste timeout (kan later dynamisch worden gemaakt als hashrate beschikbaar is) ---
-    int timeout_ms = 500;  // 500 ms is een goede standaard
+    // --- Vaste timeout ingesteld op 4000 ms (4 seconden) ---
+    int timeout_ms = 4000;
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready!");
@@ -95,7 +95,7 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGW(TAG, "Protocol switch detected during dequeue, discarding stale item");
                 free(new_work);
                 current_work_protocol = active_protocol;
-                timeout_ms = 500;  // reset timeout
+                timeout_ms = 4000;
                 continue;
             }
 
@@ -150,7 +150,7 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
             if (active_protocol == STRATUM_PROTOCOL_V2 && !stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                timeout_ms = 500;
+                timeout_ms = 4000;
                 continue;
             }
         }
@@ -160,7 +160,7 @@ void create_jobs_task(void *pvParameters)
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
             current_work_protocol = active_protocol;
-            timeout_ms = 500;
+            timeout_ms = 4000;
             continue;
         }
 
@@ -174,11 +174,12 @@ void create_jobs_task(void *pvParameters)
             }
         } else {
             generate_work(GLOBAL_STATE, (mining_notify *)current_work, extranonce_2, difficulty);
-            // Verbetering: grotere stap voor extranonce_2
+            // Grotere stap voor extranonce_2
             extranonce_2 += 1000;
             if (extranonce_2 > UINT64_MAX - 1000) extranonce_2 = 0;
         }
-        timeout_ms = 500;  // reset timeout (blijft vast)
+        // Reset timeout naar 4000 ms voor volgende iteratie
+        timeout_ms = 4000;
     }
 }
 
@@ -215,7 +216,7 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
         ESP_LOGW(TAG, "Timestamp offset capped, resetting to 0");
     }
 
-    // Verbetering: deterministische startnonce (geen esp_random)
+    // Deterministische startnonce (geen esp_random)
     next_job->starting_nonce = (uint32_t)((extranonce_2 * 0x9e3779b9ULL) & 0xFFFFFFFF);
 
     // Metadata
