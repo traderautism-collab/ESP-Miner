@@ -23,37 +23,43 @@ static const char *TAG = "create_jobs_task";
 #define MAX_EXTRANONCE2_LEN 32
 #define MAX_EXTRANONCE2_STR (MAX_EXTRANONCE2_LEN * 2 + 1)
 
-// Golden Ratio constants voor maximale spreiding
+// Golden Ratio constants
 #define STEP_GOLDEN_RATIO_64 0x9E3779B97F4A7C15ULL
 #define STEP_GOLDEN_RATIO_32 0x9E3779B9ULL
 
-// Optimale stapgroottes voor 1.2 TH/s
-#define STEP_OPTIMAL_4BYTE_1 0x7FFFFFFFULL  // 2.147.483.647
-#define STEP_OPTIMAL_4BYTE_2 0xBFFFFFFFULL  // 3.221.225.471
-#define STEP_OPTIMAL_4BYTE_3 0xDFFFFFFFULL  // 3.758.096.383
-#define STEP_OPTIMAL_4BYTE_4 0xEFFFFFFFULL  // 4.026.531.839
+// Optimale STAP voor 1.2 TH/s - gebruik een KLEINE stap!
+// Dit zorgt dat je veel opeenvolgende waarden test
+#define STEP_OPTIMAL_SMALL_1 0x00010001ULL  // 65.537
+#define STEP_OPTIMAL_SMALL_2 0x00020003ULL  // 131.075
+#define STEP_OPTIMAL_SMALL_3 0x00040007ULL  // 262.151
+#define STEP_OPTIMAL_SMALL_4 0x0008000BULL  // 524.299
+
+// Hoeveelheid unieke waarden per job (bij 1.2 TH/s, 10 minuten)
+// 7.2e14 hashes / 4.29e9 = ~167.000 keer de hele ruimte
+// Dus we kunnen VEEL waarden testen!
+#define WAARDEN_PER_JOB 1000000  // 1 miljoen unieke waarden per job
 
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty);
 static void generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job, double difficulty);
 static void generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *job, double difficulty, uint64_t extranonce_2_counter);
 
-// Bepaal de juiste stapgrootte op basis van de pool-extranonce lengte
+// Bepaal de juiste stapgrootte - gebruik KLEINE stappen!
 static inline uint64_t get_extranonce2_step(uint8_t len)
 {
     if (len >= 8) {
         return STEP_GOLDEN_RATIO_64;
     }
     
-    // Voor 4 bytes: kies een willekeurige optimale stap
-    // Dit zorgt voor variatie tussen verschillende jobs
+    // Voor 4 bytes: gebruik een kleine, oneven stap
+    // Dit zorgt dat we veel opeenvolgende waarden testen
     uint32_t random = esp_random();
     uint64_t step;
     
     switch (random % 4) {
-        case 0: step = STEP_OPTIMAL_4BYTE_1; break;
-        case 1: step = STEP_OPTIMAL_4BYTE_2; break;
-        case 2: step = STEP_OPTIMAL_4BYTE_3; break;
-        default: step = STEP_OPTIMAL_4BYTE_4; break;
+        case 0: step = STEP_OPTIMAL_SMALL_1; break;
+        case 1: step = STEP_OPTIMAL_SMALL_2; break;
+        case 2: step = STEP_OPTIMAL_SMALL_3; break;
+        default: step = STEP_OPTIMAL_SMALL_4; break;
     }
     
     // Zorg dat het oneven is (relatief priem t.o.v. macht van 2)
@@ -64,7 +70,7 @@ static inline uint64_t get_extranonce2_step(uint8_t len)
     return step;
 }
 
-// Pas maskering toe zodat de counter niet groter wordt dan toegestaan door de pool
+// Pas maskering toe
 static inline uint64_t mask_extranonce2(uint64_t val, uint8_t len)
 {
     if (len >= 8) {
@@ -74,21 +80,19 @@ static inline uint64_t mask_extranonce2(uint64_t val, uint8_t len)
     return val & mask;
 }
 
-// Genereer een willekeurige startwaarde voor extranonce2
+// Genereer een willekeurige startwaarde
 static inline uint64_t get_random_extranonce2_start(uint8_t len)
 {
     uint64_t start;
     if (len >= 8) {
-        // 64-bit random
         start = ((uint64_t)esp_random() << 32) | esp_random();
     } else {
-        // 32-bit random (of minder)
         start = esp_random();
     }
     return mask_extranonce2(start, len);
 }
 
-// Free a work item using the correct free function for the protocol it was created under
+// Free a work item
 static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protocol_t protocol)
 {
     if (!work) return;
@@ -96,7 +100,7 @@ static void free_work_item(GlobalState *GLOBAL_STATE, void *work, stratum_protoc
         if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
             sv2_ext_job_free((sv2_ext_job_t *)work);
         } else {
-            free(work);  // sv2_job_t is flat
+            free(work);
         }
     } else {
         STRATUM_V1_free_mining_notify(work);
@@ -111,17 +115,28 @@ void create_jobs_task(void *pvParameters)
     void *current_work = NULL;
     stratum_protocol_t current_work_protocol = GLOBAL_STATE->stratum_protocol;
     
-    // 🔥 START MET EEN WILLEKEURIGE WAARDE (ipv 0)
+    // 🔥 START MET EEN WILLEKEURIGE WAARDE
     uint64_t extranonce_2 = get_random_extranonce2_start(GLOBAL_STATE->extranonce_2_len);
     uint64_t extranonce_2_step = get_extranonce2_step(GLOBAL_STATE->extranonce_2_len);
-    
-    // Zorg dat de stap past binnen de toegestane lengte
     extranonce_2_step = mask_extranonce2(extranonce_2_step, GLOBAL_STATE->extranonce_2_len);
     if ((extranonce_2_step & 1) == 0) {
-        extranonce_2_step |= 1;  // Maak oneven
+        extranonce_2_step |= 1;
     }
 
-    ESP_LOGI(TAG, "🚀 Golden Ratio optimalisatie geactiveerd voor 1.2 TH/s");
+    // 🔥 BEREKEN HOEVEEL WAARDEN WE KUNNEN TESTEN
+    uint64_t waarden_per_job = WAARDEN_PER_JOB;
+    if (GLOBAL_STATE->extranonce_2_len < 8) {
+        // Voor 4 bytes: max 4.29 miljard, we testen 1 miljoen per job
+        // Dat is ~0.023% van de ruimte per job
+        // Na 100 jobs hebben we ~2.3% gedekt
+        // Na 1000 jobs ~23%
+        // Na 4300 jobs de hele ruimte
+        ESP_LOGI(TAG, "📊 We testen ~%llu unieke waarden per job (van de %llu mogelijk)", 
+                 (unsigned long long)waarden_per_job,
+                 (unsigned long long)(1ULL << (GLOBAL_STATE->extranonce_2_len * 8)));
+    }
+
+    ESP_LOGI(TAG, "🚀 Golden Ratio optimalisatie met KLEINE stap voor 1.2 TH/s");
     ESP_LOGI(TAG, "   Start extranonce2: 0x%llx", (unsigned long long)extranonce_2);
     ESP_LOGI(TAG, "   Stapgrootte: 0x%llx (%llu)", 
              (unsigned long long)extranonce_2_step, 
@@ -135,11 +150,11 @@ void create_jobs_task(void *pvParameters)
     uint64_t jobs_verwerkt = 0;
     uint64_t total_hashes_estimate = 0;
     uint64_t start_time_total = esp_timer_get_time();
+    uint64_t start_job_counter = extranonce_2;  // Voor tracking
 
     while (1) {
         // Check voor reset
         if (GLOBAL_STATE->reset_extranonce2) {
-            // 🔥 Nieuwe random start bij reset
             extranonce_2 = get_random_extranonce2_start(GLOBAL_STATE->extranonce_2_len);
             extranonce_2_step = get_extranonce2_step(GLOBAL_STATE->extranonce_2_len);
             extranonce_2_step = mask_extranonce2(extranonce_2_step, GLOBAL_STATE->extranonce_2_len);
@@ -147,20 +162,20 @@ void create_jobs_task(void *pvParameters)
                 extranonce_2_step |= 1;
             }
             
-            ESP_LOGI(TAG, "🔄 Reset extranonce2 - Nieuwe start: 0x%llx, Stap: 0x%llx", 
+            ESP_LOGI(TAG, "🔄 Reset - Start: 0x%llx, Stap: 0x%llx", 
                      (unsigned long long)extranonce_2, 
                      (unsigned long long)extranonce_2_step);
             GLOBAL_STATE->reset_extranonce2 = false;
             jobs_verwerkt = 0;
+            start_job_counter = extranonce_2;
         }
 
-        // Read protocol dynamically each iteration (coordinator may have switched it)
+        // Read protocol
         stratum_protocol_t active_protocol = GLOBAL_STATE->stratum_protocol;
 
-        // If protocol changed, discard current_work (it belongs to the old protocol)
         if (active_protocol != current_work_protocol) {
             if (current_work != NULL) {
-                ESP_LOGI(TAG, "Protocol switched from %s to %s, discarding current work",
+                ESP_LOGI(TAG, "Protocol switched from %s to %s",
                          current_work_protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1,
                          active_protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
                 free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
@@ -175,13 +190,11 @@ void create_jobs_task(void *pvParameters)
 
         if (new_work != NULL) {
             active_protocol = GLOBAL_STATE->stratum_protocol;
-
-            // Free previous work using the protocol it was created under
             free_work_item(GLOBAL_STATE, current_work, current_work_protocol);
             current_work = NULL;
 
             if (active_protocol != current_work_protocol) {
-                ESP_LOGW(TAG, "Protocol switch detected during dequeue, discarding stale item");
+                ESP_LOGW(TAG, "Protocol switch detected during dequeue");
                 free(new_work);
                 current_work_protocol = active_protocol;
                 timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
@@ -190,24 +203,24 @@ void create_jobs_task(void *pvParameters)
 
             if (current_work_protocol == STRATUM_PROTOCOL_V2) {
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                    ESP_LOGI(TAG, "New Work Dequeued SV2 ext job %lu", ((sv2_ext_job_t *)new_work)->job_id);
+                    ESP_LOGI(TAG, "New SV2 ext job %lu", ((sv2_ext_job_t *)new_work)->job_id);
                 } else {
-                    ESP_LOGI(TAG, "New Work Dequeued SV2 job %lu", ((sv2_job_t *)new_work)->job_id);
+                    ESP_LOGI(TAG, "New SV2 job %lu", ((sv2_job_t *)new_work)->job_id);
                 }
             } else {
-                ESP_LOGI(TAG, "New Work Dequeued %s", ((mining_notify *)new_work)->job_id);
+                ESP_LOGI(TAG, "New job %s", ((mining_notify *)new_work)->job_id);
             }
 
             current_work = new_work;
 
             if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
-                ESP_LOGI(TAG, "New pool difficulty %.2f", GLOBAL_STATE->pool_difficulty);
+                ESP_LOGI(TAG, "New difficulty %.2f", GLOBAL_STATE->pool_difficulty);
                 difficulty = GLOBAL_STATE->pool_difficulty;
                 GLOBAL_STATE->new_set_mining_difficulty_msg = false;
             }
 
             if (GLOBAL_STATE->new_stratum_version_rolling_msg && GLOBAL_STATE->ASIC_initalized) {
-                ESP_LOGI(TAG, "Set chip version rolls %i", (int)(GLOBAL_STATE->version_mask >> 13));
+                ESP_LOGI(TAG, "Set version rolls %i", (int)(GLOBAL_STATE->version_mask >> 13));
                 ASIC_set_version_mask(GLOBAL_STATE, GLOBAL_STATE->version_mask);
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
@@ -223,23 +236,20 @@ void create_jobs_task(void *pvParameters)
             } else {
                 clean = ((mining_notify *)current_work)->clean_jobs;
             }
-            if (!clean) {
-                continue;
-            }
             
-            // 🔥 Bij een nieuwe "clean" job: reset de teller voor betere spreiding
+            // 🔥 Bij CLEAN job: nieuwe random start voor maximale spreiding
             if (clean) {
-                // Nieuwe random start voor elke schone job
                 extranonce_2 = get_random_extranonce2_start(GLOBAL_STATE->extranonce_2_len);
-                // Varieer ook de stap per job
+                // Varieer de stap ook
                 extranonce_2_step = get_extranonce2_step(GLOBAL_STATE->extranonce_2_len);
                 extranonce_2_step = mask_extranonce2(extranonce_2_step, GLOBAL_STATE->extranonce_2_len);
                 if ((extranonce_2_step & 1) == 0) {
                     extranonce_2_step |= 1;
                 }
                 jobs_verwerkt = 0;
+                start_job_counter = extranonce_2;
                 
-                ESP_LOGI(TAG, "✨ Clean job - Start: 0x%llx, Stap: 0x%llx", 
+                ESP_LOGI(TAG, "✨ CLEAN job - Nieuwe start: 0x%llx, Stap: 0x%llx", 
                          (unsigned long long)extranonce_2, 
                          (unsigned long long)extranonce_2_step);
             }
@@ -263,11 +273,13 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // Generate and send job
-        ESP_LOGI(TAG, "📊 Job #%llu - Extranonce2: 0x%llx (dec: %llu)", 
-                 (unsigned long long)jobs_verwerkt,
-                 (unsigned long long)extranonce_2, 
-                 (unsigned long long)extranonce_2);
+        // 🔥 Generate en send job - met KLEINE stap
+        if (jobs_verwerkt % 10000 == 0) {
+            ESP_LOGI(TAG, "📊 Job #%llu - Extranonce2: 0x%llx (dec: %llu)", 
+                     (unsigned long long)jobs_verwerkt,
+                     (unsigned long long)extranonce_2, 
+                     (unsigned long long)extranonce_2);
+        }
 
         if (active_protocol == STRATUM_PROTOCOL_V2) {
             if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
@@ -283,40 +295,51 @@ void create_jobs_task(void *pvParameters)
         
         jobs_verwerkt++;
         
-        // 🔥 Extra: na een X aantal jobs, forceer een nieuwe random start
-        // Dit voorkomt dat je vastloopt in een patroon
-        if (jobs_verwerkt % 100 == 0) {
+        // 🔥 NA 1 MILJOEN WAARDEN: spring naar een NIEUWE random start
+        // Dit voorkomt dat we in een klein gebied blijven hangen
+        if (jobs_verwerkt >= WAARDEN_PER_JOB) {
             uint64_t nieuwe_start = get_random_extranonce2_start(GLOBAL_STATE->extranonce_2_len);
-            extranonce_2 = nieuwe_start;
             
-            // Varieer ook de stap na 100 jobs
+            // Zorg dat we niet op dezelfde plek blijven
+            while (nieuwe_start == extranonce_2) {
+                nieuwe_start = get_random_extranonce2_start(GLOBAL_STATE->extranonce_2_len);
+            }
+            
+            extranonce_2 = nieuwe_start;
+            start_job_counter = extranonce_2;
+            
+            // Varieer ook de stap
             extranonce_2_step = get_extranonce2_step(GLOBAL_STATE->extranonce_2_len);
             extranonce_2_step = mask_extranonce2(extranonce_2_step, GLOBAL_STATE->extranonce_2_len);
             if ((extranonce_2_step & 1) == 0) {
                 extranonce_2_step |= 1;
             }
             
-            ESP_LOGI(TAG, "🎯 Na %llu jobs, sprong naar nieuwe start: 0x%llx, stap: 0x%llx", 
+            ESP_LOGI(TAG, "🎯 Na %llu jobs (%.2f%% van ruimte), sprong naar nieuwe start: 0x%llx, stap: 0x%llx", 
                      (unsigned long long)jobs_verwerkt,
+                     (float)(jobs_verwerkt * 100.0) / (1ULL << (GLOBAL_STATE->extranonce_2_len * 8)),
                      (unsigned long long)extranonce_2,
                      (unsigned long long)extranonce_2_step);
+            
+            jobs_verwerkt = 0;
         }
         
-        // Toon statistieken elke 1000 jobs
-        if (jobs_verwerkt % 1000 == 0) {
+        // Toon statistieken elke 100.000 jobs
+        if (jobs_verwerkt > 0 && jobs_verwerkt % 100000 == 0) {
             uint64_t current_time = esp_timer_get_time();
             uint64_t elapsed_sec = (current_time - start_time_total) / 1000000;
             if (elapsed_sec > 0) {
                 uint64_t hashrate = (total_hashes_estimate * 1000) / elapsed_sec;
-                ESP_LOGI(TAG, "📈 Stats: %llu jobs in %llu sec, ~%llu H/s", 
+                float percentage = (float)(jobs_verwerkt * 100.0) / (1ULL << (GLOBAL_STATE->extranonce_2_len * 8));
+                ESP_LOGI(TAG, "📈 Stats: %llu jobs, %.4f%% van ruimte, ~%llu H/s", 
                          (unsigned long long)jobs_verwerkt,
-                         (unsigned long long)elapsed_sec,
+                         percentage,
                          (unsigned long long)hashrate);
             }
         }
         
-        // Update hash estimate (schatting op basis van ASIC snelheid)
-        total_hashes_estimate += 1200000000000ULL; // 1.2 TH/s per seconde
+        // Update hash estimate
+        total_hashes_estimate += 1200000000000ULL; // 1.2 TH/s
         
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
@@ -325,7 +348,7 @@ void create_jobs_task(void *pvParameters)
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, double difficulty)
 {
     if (GLOBAL_STATE->extranonce_2_len > MAX_EXTRANONCE2_LEN) {
-        ESP_LOGE(TAG, "extranonce_2_len %d exceeds maximum %d, skipping job", GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
+        ESP_LOGE(TAG, "extranonce_2_len %d exceeds maximum %d", GLOBAL_STATE->extranonce_2_len, MAX_EXTRANONCE2_LEN);
         return;
     }
     char extranonce_2_str[MAX_EXTRANONCE2_STR];
