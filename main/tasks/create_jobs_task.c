@@ -1,8 +1,3 @@
-// ============================================================
-// create_jobs_task.c
-// Volledige implementatie: version rolling + job dispatch
-// ============================================================
-
 #include <sys/time.h>
 #include <limits.h>
 #include <string.h>
@@ -16,7 +11,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
-#include "mining.h"
+#include "mining.h"          // bevat al increment_bitmask() declaratie
 #include "asic.h"
 #include "system.h"
 #include "sv2_protocol.h"
@@ -33,28 +28,15 @@ static const char *TAG = "create_jobs_task";
 // 1. VERSION ROLLING HELPERS
 // ============================================================
 
-/**
- * Tel 1 op bij de laagste vrije bit binnen de mask.
- * Alleen bits die 1 zijn in de mask mogen veranderen.
- */
-static uint32_t increment_bitmask(uint32_t version, uint32_t mask)
-{
-    uint32_t new_version = version + 1;
-    return (version & ~mask) | (new_version & mask);
-}
+// LET OP: increment_bitmask() is al gedeclareerd in mining.h
+//         en gedefinieerd in mining.c — NIET hier opnieuw definiëren.
 
-/**
- * Valideer de mask volgens BIP320.
- * Alleen bits 13..28 mogen rollen.
- */
 static bool is_valid_version_mask(uint32_t mask)
 {
     const uint32_t BIP320_ALLOWED = 0x1FFFE000;
 
     if (mask == 0) return false;
     if (mask & ~BIP320_ALLOWED) return false;
-
-    // Minimaal 2 roll-bits zoals BIP320 voorschrijft
     if (__builtin_popcount(mask) < 2) return false;
 
     return true;
@@ -82,7 +64,6 @@ void stratum_handle_set_version_mask(GlobalState *GLOBAL_STATE, uint32_t new_mas
 
     GLOBAL_STATE->version_mask = new_mask;
     GLOBAL_STATE->new_stratum_version_rolling_msg = true;
-    GLOBAL_STATE->version_rolling_negotiated = true;
 }
 
 /**
@@ -376,8 +357,8 @@ void create_jobs_task(void *pvParameters)
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready! (Version Rolling + BIP320 + Auto-Job-Update)");
-    ESP_LOGI(TAG, "Version rolling negotiated: %s",
-             GLOBAL_STATE->version_rolling_negotiated ? "yes" : "no");
+    ESP_LOGI(TAG, "Version mask initieel: 0x%08" PRIx32,
+             GLOBAL_STATE->version_mask);
 
     while (1) {
         // === 1. Version mask update naar ASIC ===
